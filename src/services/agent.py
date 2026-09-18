@@ -25,6 +25,7 @@ from livekit.agents import (
 
 from backend import BackendClient, backend_api_key
 from services.cartesia import build_tts
+from services.election_info import election_facts
 
 logger = logging.getLogger("effi-agent")
 
@@ -39,12 +40,15 @@ except ImportError:
 
 INSTRUCTIONS = textwrap.dedent(
     """\
-    You are Effi, the EffiGov resident services voice agent for a city 311-style desk.
+    You are Effi, the EffiGov resident services voice agent for Cedarbrook.
 
-    You help residents report a missed city service, ask for a case update, or file a new request.
     You are speaking on a phone call. Keep replies to one or two short sentences. Ask only one question at a time.
 
-    Collect, in this order, before you create a new case:
+    Many callers only want information. Do not create a case, collect a name, or collect a phone number unless they are reporting a missed city service, filing a new request, or asking you to look up or update an existing case.
+
+    For questions about the Cedarbrook municipal election, call get_election_info. Answer from the tool result: election day and hours, early voting, polling places, and what photo ID or proof of residency to bring. Do not invent extra election rules. If they only want election information, never open a case.
+
+    If they do want a service case, collect, in this order, before you create a new case:
     1. Full name
     2. Phone number
     3. Whether they are reporting a missed service, checking an existing case, or making a new request
@@ -52,7 +56,7 @@ INSTRUCTIONS = textwrap.dedent(
 
     If they want an update, look up the case by phone number or case number such as E G one zero zero one.
     Confirm the details out loud before you create or update a case, then use a tool.
-    After a tool succeeds, tell them the case number slowly, digit by digit, and the current status.
+    After a case tool succeeds, tell them the case number slowly, digit by digit, and the current status.
     Never invent a case number. If a tool fails, say you could not save it and offer to try again.
 
     Speak plainly. No lists, markdown, or acronyms unless the resident used them first.
@@ -69,6 +73,19 @@ class ResidentAgent(Agent):
         self._client = client
         self._call_id = call_id
         self._active_case_id: str | None = None
+
+    @function_tool()
+    async def get_election_info(
+        self,
+        context: RunContext,
+        topic: str = "overview",
+    ) -> dict[str, Any]:
+        """Look up Cedarbrook municipal election times, polling places, or ID rules. Use this for information-only questions. Do not create a case.
+
+        Args:
+            topic: One of overview, times, locations, or documentation.
+        """
+        return election_facts(topic)
 
     async def _attach(self, case_id: str) -> None:
         self._active_case_id = case_id
@@ -225,13 +242,17 @@ async def resident_session(ctx: JobContext) -> None:
         ),
     )
 
+    async def post_transcript(role: str, text: str, is_final: bool = True) -> None:
+        try:
+            await client.post_transcript(call_id, role, text, is_final=is_final)
+        except Exception:
+            logger.warning("Could not persist %s transcript for call %s", role, call_id)
+
     @session.on("user_input_transcribed")
     def on_user_input(event: UserInputTranscribedEvent) -> None:
         if not event.transcript.strip():
             return
-        asyncio.create_task(
-            client.post_transcript(call_id, "resident", event.transcript, is_final=event.is_final)
-        )
+        asyncio.create_task(post_transcript("resident", event.transcript, is_final=event.is_final))
 
     @session.on("conversation_item_added")
     def on_item(event: ConversationItemAddedEvent) -> None:
@@ -239,7 +260,7 @@ async def resident_session(ctx: JobContext) -> None:
         role = getattr(item, "role", "")
         text = (getattr(item, "text_content", None) or "").strip()
         if role == "assistant" and text:
-            asyncio.create_task(client.post_transcript(call_id, "agent", text, is_final=True))
+            asyncio.create_task(post_transcript("agent", text))
 
     async def shutdown() -> None:
         recorder = getattr(session, "_recorder_io", None)
@@ -279,7 +300,10 @@ async def resident_session(ctx: JobContext) -> None:
     ctx.add_shutdown_callback(shutdown)
     await ctx.connect()
     await session.generate_reply(
-        instructions="Greet the resident, say you are Effi with city resident services, and ask how you can help."
+        instructions=(
+            "Greet the resident, say you are Effi with Cedarbrook resident services, "
+            "and ask how you can help with city services or election information."
+        )
     )
 
 
